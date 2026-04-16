@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+
+APP_TITLE = "S&P 500 Breakout Breadth Dashboard"
+WIKI_SP500_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+DEFAULT_PROVIDER = "yfinance"
+DEFAULT_SCAN_WINDOW = 30
+DEFAULT_LOOKBACK_HIGH = 20
+DEFAULT_VOLUME_WINDOW = 20
+DEFAULT_VOLUME_MULTIPLIER = 1.5
+DEFAULT_HOLD_DAYS = 5
+DEFAULT_STOP_LOSS_PCT = 0.03
+DEFAULT_BATCH_SIZE = 50
+DEFAULT_HISTORY_PERIOD = "1y"
+LOW_CONFIDENCE_ATTEMPTS = 10
+OVERBOUGHT_BREADTH_THRESHOLD = 40.0
+OVERBOUGHT_SUCCESS_RATE = 0.60
+HEALTHY_BREADTH_THRESHOLD = 10.0
+CACHE_TTL_SECONDS = 3600
+LOOKBACK_BUFFER_DAYS = 120
+FORWARD_BUFFER_DAYS = 21
+REQUEST_TIMEOUT_SECONDS = 30
+MAX_ANALYSIS_WORKERS = 8
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+CACHE_ROOT = ROOT_DIR / ".cache" / "breakout_breadth"
+CONSTITUENT_CACHE_DIR = CACHE_ROOT / "constituents"
+OHLCV_CACHE_DIR = CACHE_ROOT / "ohlcv"
+
+REQUIRED_OHLCV_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
+EVENT_OUTCOMES = ("success", "failure", "pending")
+FAILURE_CLOSE_LOST = "close_lost_breakout_level"
+FAILURE_STOP_LOSS = "stop_loss_triggered"
+
+REGIME_COLORS = {
+    "Overbought": "#0f766e",
+    "Healthy": "#2563eb",
+    "Warning": "#b91c1c",
+}
