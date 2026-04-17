@@ -122,13 +122,20 @@ def _prepare_frame(price_df: pd.DataFrame) -> pd.DataFrame:
     return frame.loc[:, list(config.REQUIRED_OHLCV_COLUMNS)].dropna(subset=["Open", "High", "Low", "Close"])
 
 
-def failure_reason_label(reason: str | None) -> str:
+def failure_reason_label(reason: Any) -> str:
+    if reason is None:
+        return "Resolved"
+    if not isinstance(reason, str):
+        try:
+            if pd.isna(reason):
+                return "Resolved"
+        except TypeError:
+            pass
+        reason = str(reason)
     if reason == config.FAILURE_STOP_LOSS:
         return "Stop-loss triggered"
     if reason == config.FAILURE_CLOSE_LOST:
         return "Lost breakout level"
-    if reason is None:
-        return "Resolved"
     return reason.replace("_", " ").title()
 
 
