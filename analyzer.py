@@ -64,6 +64,8 @@ class UniverseBreadthAnalysis:
     history: pd.DataFrame
     daily_counts: pd.DataFrame
     watchlist: pd.DataFrame
+    rs_ranking: pd.DataFrame
+    waiting_watchlist: pd.DataFrame
     last_events: pd.DataFrame
     events: tuple[BreakoutEvent, ...]
     diagnostics: dict[str, Any]
@@ -137,6 +139,174 @@ def failure_reason_label(reason: Any) -> str:
     if reason == config.FAILURE_CLOSE_LOST:
         return "Lost breakout level"
     return reason.replace("_", " ").title()
+
+
+def _frame_until(frame: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
+    return frame.loc[frame.index <= pd.Timestamp(as_of)].copy()
+
+
+def _trailing_return(frame: pd.DataFrame, lookback: int, as_of: pd.Timestamp) -> float | None:
+    clipped = _frame_until(frame, as_of)
+    if clipped.empty or len(clipped) <= lookback:
+        return None
+    current_close = clipped["Close"].iloc[-1]
+    base_close = clipped["Close"].iloc[-lookback - 1]
+    if pd.isna(current_close) or pd.isna(base_close) or float(base_close) == 0.0:
+        return None
+    return float(current_close / base_close - 1.0)
+
+
+def _build_relative_strength_table(
+    valid_items: list[tuple[str, pd.DataFrame]],
+    benchmark_frame: pd.DataFrame | None,
+    as_of: pd.Timestamp,
+) -> pd.DataFrame:
+    weights = {21: 0.2, 63: 0.3, 126: 0.3, 252: 0.2}
+    benchmark_returns = {
+        lookback: _trailing_return(benchmark_frame, lookback, as_of) if benchmark_frame is not None and not benchmark_frame.empty else None
+        for lookback in config.RS_LOOKBACK_PERIODS
+    }
+
+    rows: list[dict[str, Any]] = []
+    for ticker, frame in valid_items:
+        clipped = _frame_until(frame, as_of)
+        if clipped.empty:
+            continue
+        weighted_score = 0.0
+        weight_total = 0.0
+        row: dict[str, Any] = {
+            "ticker": ticker,
+            "price": float(clipped["Close"].iloc[-1]),
+        }
+        for lookback in config.RS_LOOKBACK_PERIODS:
+            stock_return = _trailing_return(clipped, lookback, as_of)
+            benchmark_return = benchmark_returns.get(lookback)
+            relative_return = None if stock_return is None else stock_return - benchmark_return if benchmark_return is not None else stock_return
+            row[f"return_{lookback}d"] = stock_return
+            row[f"relative_{lookback}d"] = relative_return
+            if relative_return is not None:
+                weighted_score += relative_return * weights.get(lookback, 0.0)
+                weight_total += weights.get(lookback, 0.0)
+        if weight_total == 0.0:
+            continue
+        row["rs_score"] = float(weighted_score / weight_total)
+        rows.append(row)
+
+    ranking = pd.DataFrame(rows)
+    if ranking.empty:
+        return ranking
+
+    ranking["rs_percentile"] = ranking["rs_score"].rank(pct=True, method="average") * 100.0
+    ranking["rs_rank"] = ranking["rs_score"].rank(method="dense", ascending=False).astype(int)
+    ranking = ranking.sort_values(["rs_score", "ticker"], ascending=[False, True]).reset_index(drop=True)
+    ordered_columns = [
+        "rs_rank",
+        "ticker",
+        "price",
+        "rs_score",
+        "rs_percentile",
+        "relative_21d",
+        "relative_63d",
+        "relative_126d",
+        "relative_252d",
+        "return_21d",
+        "return_63d",
+        "return_126d",
+        "return_252d",
+    ]
+    return ranking.loc[:, ordered_columns]
+
+
+def _build_waiting_watchlist(
+    valid_items: list[tuple[str, pd.DataFrame]],
+    params: BreakoutParams,
+    as_of: pd.Timestamp,
+    rs_ranking: pd.DataFrame,
+) -> pd.DataFrame:
+    rs_lookup = rs_ranking.set_index("ticker") if not rs_ranking.empty else pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    minimum_rows = max(params.lookback_high, params.vol_window, 20) + 2
+
+    for ticker, frame in valid_items:
+        clipped = _frame_until(frame, as_of)
+        if clipped.empty or len(clipped) < minimum_rows:
+            continue
+
+        resistance = clipped["Close"].rolling(params.lookback_high).max().shift(1).iloc[-1]
+        avg_volume = clipped["Volume"].rolling(params.vol_window).mean().shift(1).iloc[-1]
+        if pd.isna(resistance) or pd.isna(avg_volume) or float(resistance) <= 0.0 or float(avg_volume) <= 0.0:
+            continue
+
+        current_close = float(clipped["Close"].iloc[-1])
+        current_high = float(clipped["High"].iloc[-1])
+        volume_ratio = float(clipped["Volume"].iloc[-1] / avg_volume) if float(avg_volume) else 0.0
+        distance_to_breakout_pct = float((float(resistance) - current_close) / float(resistance))
+        if distance_to_breakout_pct < 0.0 or distance_to_breakout_pct > config.WAITING_WATCHLIST_MAX_DISTANCE_PCT:
+            continue
+
+        tr = _true_range(clipped)
+        atr_5 = tr.rolling(5).mean().shift(1).iloc[-1]
+        atr_20 = tr.rolling(20).mean().shift(1).iloc[-1]
+        close_range_5 = (clipped["Close"].rolling(5).max() - clipped["Close"].rolling(5).min()).shift(1).iloc[-1]
+        close_range_20 = (clipped["Close"].rolling(20).max() - clipped["Close"].rolling(20).min()).shift(1).iloc[-1]
+        prior_close = clipped["Close"].shift(1).iloc[-1]
+
+        atr_contraction = 0.0
+        if pd.notna(atr_5) and pd.notna(atr_20) and float(atr_20) > 0.0:
+            atr_contraction = max(0.0, min(1.0, float((atr_20 - atr_5) / atr_20)))
+
+        range_tightness = 0.0
+        if pd.notna(close_range_5) and pd.notna(close_range_20) and float(close_range_20) > 0.0:
+            range_tightness = max(0.0, min(1.0, float(1.0 - (close_range_5 / close_range_20))))
+
+        rs_percentile = float(rs_lookup.at[ticker, "rs_percentile"]) if not rs_lookup.empty and ticker in rs_lookup.index else 0.0
+        if rs_percentile < config.WAITING_WATCHLIST_MIN_RS_PERCENTILE:
+            continue
+
+        proximity_score = max(0.0, 1.0 - (distance_to_breakout_pct / config.WAITING_WATCHLIST_MAX_DISTANCE_PCT))
+        volume_score = max(0.0, min(1.0, volume_ratio / max(params.volume_multiplier, 1.0)))
+        rs_score_component = max(0.0, min(1.0, rs_percentile / 100.0))
+        strict_ready = bool(
+            pd.notna(atr_5)
+            and pd.notna(atr_20)
+            and pd.notna(close_range_5)
+            and pd.notna(close_range_20)
+            and pd.notna(prior_close)
+            and float(atr_5) < float(atr_20)
+            and float(close_range_5) <= float(close_range_20) * 0.60
+            and float(prior_close) >= float(resistance) * 0.98
+        )
+        waiting_score = float(
+            100.0
+            * (
+                0.45 * proximity_score
+                + 0.25 * rs_score_component
+                + 0.15 * atr_contraction
+                + 0.10 * range_tightness
+                + 0.05 * volume_score
+            )
+        )
+
+        rows.append(
+            {
+                "ticker": ticker,
+                "waiting_score": waiting_score,
+                "rs_percentile": rs_percentile,
+                "distance_to_breakout_pct": distance_to_breakout_pct,
+                "breakout_level": float(resistance),
+                "current_close": current_close,
+                "current_high": current_high,
+                "volume_ratio": volume_ratio,
+                "atr_contraction": atr_contraction,
+                "range_tightness": range_tightness,
+                "strict_ready": strict_ready,
+            }
+        )
+
+    waiting = pd.DataFrame(rows)
+    if waiting.empty:
+        return waiting
+    return waiting.sort_values(["waiting_score", "ticker"], ascending=[False, True]).reset_index(drop=True)
 
 
 def analyze_ticker_breakouts(price_df: pd.DataFrame, ticker: str, params: BreakoutParams) -> list[BreakoutEvent]:
@@ -306,6 +476,8 @@ def _empty_analysis(params: BreakoutParams, as_of: pd.Timestamp) -> UniverseBrea
         history=history,
         daily_counts=pd.DataFrame(columns=["breakout_date", "success", "failure", "pending"]),
         watchlist=pd.DataFrame(),
+        rs_ranking=pd.DataFrame(),
+        waiting_watchlist=pd.DataFrame(),
         last_events=pd.DataFrame(),
         events=tuple(),
         diagnostics={"tickers_requested": 0, "tickers_analyzed": 0, "tickers_with_events": 0, "event_count": 0, "window_start": as_of, "window_end": as_of},
@@ -318,6 +490,7 @@ def analyze_universe_breakouts(
     *,
     start_date: pd.Timestamp | None = None,
     end_date: pd.Timestamp | None = None,
+    benchmark_frame: pd.DataFrame | None = None,
 ) -> UniverseBreadthAnalysis:
     valid_items = [(ticker, _prepare_frame(frame)) for ticker, frame in price_frames.items() if frame is not None]
     valid_items = [(ticker, frame) for ticker, frame in valid_items if not frame.empty]
@@ -350,7 +523,50 @@ def analyze_universe_breakouts(
 
     rows = pd.DataFrame(_event_to_row(event) for event in all_events)
     if rows.empty:
-        return _empty_analysis(params, pd.Timestamp(visible_calendar.max()))
+        latest_as_of = pd.Timestamp(visible_calendar.max())
+        rs_ranking = _build_relative_strength_table(valid_items, benchmark_frame, latest_as_of)
+        waiting_watchlist = _build_waiting_watchlist(
+            valid_items,
+            params,
+            latest_as_of,
+            rs_ranking,
+        )
+        return UniverseBreadthAnalysis(
+            params=params,
+            snapshot=_snapshot_from_rows(pd.DataFrame(columns=["outcome"]), latest_as_of),
+            history=pd.DataFrame(
+                [
+                    {
+                        "as_of": latest_as_of,
+                        "attempts": 0,
+                        "successes": 0,
+                        "failures": 0,
+                        "pending": 0,
+                        "breadth_index": 0.0,
+                        "regime": _infer_regime(0, 0.0, 0.0),
+                        "confidence_flag": True,
+                        "success_rate": 0.0,
+                    }
+                ]
+            ),
+            daily_counts=pd.DataFrame(columns=["breakout_date", "success", "failure", "pending"]),
+            watchlist=pd.DataFrame(),
+            rs_ranking=rs_ranking,
+            waiting_watchlist=waiting_watchlist,
+            last_events=pd.DataFrame(),
+            events=tuple(),
+            diagnostics={
+                "tickers_requested": len(price_frames),
+                "tickers_analyzed": len(valid_items),
+                "tickers_with_events": 0,
+                "event_count": 0,
+                "window_start": latest_as_of,
+                "window_end": latest_as_of,
+                "max_workers": max_workers,
+                "benchmark_symbol": config.BENCHMARK_SYMBOL,
+                "benchmark_available": bool(benchmark_frame is not None and not benchmark_frame.empty),
+            },
+        )
 
     rows["breakout_date"] = pd.to_datetime(rows["breakout_date"])
     rows["resolved_at"] = pd.to_datetime(rows["resolved_at"])
@@ -358,9 +574,11 @@ def analyze_universe_breakouts(
 
     history_rows: list[dict[str, Any]] = []
     visible_dates = pd.DatetimeIndex(visible_calendar)
-    for position, as_of in enumerate(visible_dates):
-        start_position = max(0, position - params.scan_window + 1)
-        window_dates = visible_dates[start_position : position + 1]
+    full_calendar_lookup = pd.Series(range(len(calendar)), index=calendar)
+    for as_of in visible_dates:
+        full_position = int(full_calendar_lookup.loc[pd.Timestamp(as_of)])
+        start_position = max(0, full_position - params.scan_window + 1)
+        window_dates = calendar[start_position : full_position + 1]
         window_start = pd.Timestamp(window_dates.min())
         window_rows = rows.loc[(rows["breakout_date"] >= window_start) & (rows["breakout_date"] <= as_of)].copy()
         if not window_rows.empty:
@@ -384,7 +602,8 @@ def analyze_universe_breakouts(
 
     history = pd.DataFrame(history_rows)
     latest_as_of = pd.Timestamp(visible_dates.max())
-    latest_window_dates = visible_dates[max(0, len(visible_dates) - params.scan_window) :]
+    latest_full_position = int(full_calendar_lookup.loc[latest_as_of])
+    latest_window_dates = calendar[max(0, latest_full_position - params.scan_window + 1) : latest_full_position + 1]
     latest_window_start = pd.Timestamp(latest_window_dates.min())
     latest_rows = rows.loc[(rows["breakout_date"] >= latest_window_start) & (rows["breakout_date"] <= latest_as_of)].copy()
     if not latest_rows.empty:
@@ -416,6 +635,9 @@ def analyze_universe_breakouts(
     if not last_events.empty:
         last_events = last_events.sort_values(["breakout_date", "ticker"], ascending=[False, True]).reset_index(drop=True)
 
+    rs_ranking = _build_relative_strength_table(valid_items, benchmark_frame, latest_as_of)
+    waiting_watchlist = _build_waiting_watchlist(valid_items, params, latest_as_of, rs_ranking)
+
     diagnostics = {
         "tickers_requested": len(price_frames),
         "tickers_analyzed": len(valid_items),
@@ -424,6 +646,8 @@ def analyze_universe_breakouts(
         "window_start": latest_window_start,
         "window_end": latest_as_of,
         "max_workers": max_workers,
+        "benchmark_symbol": config.BENCHMARK_SYMBOL,
+        "benchmark_available": bool(benchmark_frame is not None and not benchmark_frame.empty),
     }
     return UniverseBreadthAnalysis(
         params=params,
@@ -431,6 +655,8 @@ def analyze_universe_breakouts(
         history=history,
         daily_counts=daily_counts,
         watchlist=watchlist,
+        rs_ranking=rs_ranking,
+        waiting_watchlist=waiting_watchlist,
         last_events=last_events,
         events=tuple(all_events),
         diagnostics=diagnostics,

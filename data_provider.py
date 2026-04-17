@@ -8,7 +8,7 @@ from io import StringIO
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 import requests
@@ -288,14 +288,17 @@ def download_ohlcv_universe(
     period: str | None = config.DEFAULT_HISTORY_PERIOD,
     batch_size: int = config.DEFAULT_BATCH_SIZE,
     force_refresh: bool = False,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[dict[str, pd.DataFrame], ProviderDiagnostics]:
     provider = get_price_provider(provider_name)
     normalized = [normalize_symbol_for_yahoo(ticker) for ticker in tickers]
     all_frames: dict[str, pd.DataFrame] = {}
     cache_hits = 0
     batch_count = 0
+    batches = _chunked(normalized, batch_size)
+    total_batches = len(batches)
 
-    for batch in _chunked(normalized, batch_size):
+    for batch_index, batch in enumerate(batches, start=1):
         batch_count += 1
         cache_path = _cache_path(
             provider.provider_name,
@@ -307,6 +310,7 @@ def download_ohlcv_universe(
         if cache_path.exists() and not force_refresh:
             cache_hits += 1
             batch_frames = pd.read_pickle(cache_path)
+            source = "cache"
         else:
             batch_frames = provider.download_batch(
                 batch,
@@ -315,7 +319,10 @@ def download_ohlcv_universe(
                 period=None if start_date is not None else period,
             )
             pd.to_pickle(batch_frames, cache_path)
+            source = "download"
         all_frames.update(batch_frames)
+        if progress_callback is not None:
+            progress_callback(batch_index, total_batches, source)
 
     missing = tuple(sorted(ticker for ticker in normalized if ticker not in all_frames or all_frames[ticker].empty))
     diagnostics = ProviderDiagnostics(
